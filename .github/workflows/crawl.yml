@@ -1,5 +1,5 @@
 # Reads every company job board in boards.json and uploads the open jobs to Career Site Jobs Search.
-# Twice a day because GitHub sometimes skips scheduled runs; a run takes about 10-20 minutes.
+# Twice a day because GitHub sometimes skips scheduled runs; ~28k boards take about 1.5 hours.
 name: crawl
 
 on:
@@ -18,7 +18,7 @@ concurrency:
 jobs:
   crawl:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
