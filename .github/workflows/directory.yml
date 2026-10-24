@@ -19,7 +19,7 @@ jobs:
         with:
           node-version: 24
       - name: Build the directory
-        run: node directory.mjs 3 && cp jobs/data/boards-cc.json boards.json
+        run: node directory.mjs 3 && node merge-directory.mjs boards.json boards.json jobs/data/boards-cc.json
       - name: Commit it
         run: |
           git config user.name "github-actions[bot]"

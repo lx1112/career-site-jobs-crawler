@@ -520,6 +520,7 @@ var file = args.find((a) => !a.startsWith("--")) ?? "boards.json";
 var limitAt = args.indexOf("--limit");
 var limit = limitAt >= 0 ? Number(args[limitAt + 1]) : Infinity;
 var upload = !args.includes("--no-upload");
+var prune = args.includes("--prune");
 var PER_ATS = 8;
 var CRAWLED_ATS = ["greenhouse", "lever", "ashby", "workable", "smartrecruiters", "recruitee"];
 var directory = JSON.parse(readFileSync(file, "utf8"));
@@ -561,6 +562,11 @@ mkdirSync("out", { recursive: true });
 writeFileSync("out/jobs.jsonl.gz", gz);
 writeFileSync("out/status.json", JSON.stringify({ crawledAt, counts, status }));
 console.log(`crawl: ${boards.length} boards (${counts.live} live, ${counts.gone} gone, ${counts.error} errors), ${counts.jobs} jobs, ${(gz.length / 1e6).toFixed(1)} MB gzipped, ${Math.round((Date.now() - started) / 1e3)} s`);
+if (prune && counts.gone) {
+  const kept = directory.boards.filter((b) => status[`${b.ats}:${b.slug}`] !== "gone");
+  writeFileSync(file, JSON.stringify({ ...directory, boards: kept }));
+  console.log(`prune: dropped ${directory.boards.length - kept.length} boards that no longer exist`);
+}
 if (upload) {
   const url = process.env.JOBS_UPLOAD_URL;
   const secret = process.env.JOBS_SECRET;

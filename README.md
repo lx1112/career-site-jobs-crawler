@@ -5,8 +5,9 @@ on Apify. It reads the public job boards that companies publish on their applica
 (Greenhouse, Lever, Ashby, Workable, SmartRecruiters and Recruitee), through each system's public
 job-board API, and uploads one snapshot of all open jobs.
 
-- `boards.json`: the directory of company boards, rebuilt monthly from
-  [Common Crawl](https://commoncrawl.org)'s URL index by `directory.mjs`.
+- `boards.json`: the directory of company boards, from [Common Crawl](https://commoncrawl.org)'s
+  URL index (`directory.mjs`, monthly) and public lists on GitHub, merged by `merge-directory.mjs`.
+  Each crawl drops boards that no longer exist.
 - `crawler.mjs`: one request per board, a few boards per system at a time. Boards that no longer
   exist are skipped.
 - `.github/workflows/`: the twice-daily crawl and the monthly directory refresh.

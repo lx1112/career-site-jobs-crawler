@@ -48,6 +48,7 @@ for (const crawl of crawls) {
         console.error(`${crawl} ${src.pattern} page ${page}: ${e.message}`);
         continue;
       }
+      console.log(`${crawl} ${src.pattern}: page ${page + 1}/${pages}`);
       for (const line of text.split("\n")) {
         if (!line) continue;
         let u;
@@ -66,11 +67,16 @@ for (const crawl of crawls) {
       await sleep(1_000);
     }
     console.log(`${crawl} ${src.pattern}: ${pages} pages, ${found} new boards (total ${boards.size})`);
+    save(); // after each source, so a stalled index doesn't lose what was read
   }
 }
-mkdirSync("jobs/data", { recursive: true });
-const list = [...boards.entries()].map(([k, hits]) => ({ ats: k.split(":")[0], slug: k.slice(k.indexOf(":") + 1), hits })).sort((a, b) => b.hits - a.hits);
-writeFileSync("jobs/data/boards-cc.json", JSON.stringify({ crawls, built: new Date().toISOString(), boards: list }));
 const by = {};
-for (const b of list) by[b.ats] = (by[b.ats] ?? 0) + 1;
+for (const b of save()) by[b.ats] = (by[b.ats] ?? 0) + 1;
 console.log("boards by ATS:", by);
+
+function save() {
+  mkdirSync("jobs/data", { recursive: true });
+  const list = [...boards.entries()].map(([k, hits]) => ({ ats: k.split(":")[0], slug: k.slice(k.indexOf(":") + 1), hits })).sort((a, b) => b.hits - a.hits);
+  writeFileSync("jobs/data/boards-cc.json", JSON.stringify({ crawls, built: new Date().toISOString(), boards: list }));
+  return list;
+}
