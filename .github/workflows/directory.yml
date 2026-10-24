@@ -1,0 +1,29 @@
+# Rebuilds boards.json from Common Crawl's URL index once a month (and on demand).
+name: directory
+
+on:
+  schedule:
+    - cron: "41 2 3 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  directory:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Build the directory
+        run: node directory.mjs 3 && cp jobs/data/boards-cc.json boards.json
+      - name: Commit it
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add boards.json
+          git diff --cached --quiet || git commit -m "Directory refresh $(date -u +%F)"
+          git push

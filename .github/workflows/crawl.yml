@@ -1,0 +1,31 @@
+# Reads every company job board in boards.json and uploads the open jobs to Career Site Jobs Search.
+# Twice a day because GitHub sometimes skips scheduled runs; a run takes about 10-20 minutes.
+name: crawl
+
+on:
+  schedule:
+    - cron: "23 4 * * *"
+    - cron: "23 16 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: crawl
+  cancel-in-progress: false
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Crawl and upload
+        run: node crawler.mjs boards.json
+        env:
+          JOBS_UPLOAD_URL: https://onchaincheck.dev/internal/jobs
+          JOBS_SECRET: ${{ secrets.JOBS_SECRET }}
