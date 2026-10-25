@@ -1,5 +1,6 @@
 # Reads every company job board in boards.json and uploads the open jobs to Career Site Jobs Search.
-# Twice a day because GitHub sometimes skips scheduled runs; ~28k boards take about 1.5 hours.
+# Twice a day because GitHub sometimes skips scheduled runs; ~28k boards take about 1.5–2 hours
+# (Workable is paced at ~1.4 requests a second).
 name: crawl
 
 on:
@@ -33,6 +34,6 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add boards.json
+          git add boards.json gone.json
           git diff --cached --quiet || git commit -m "Drop boards that no longer exist"
           git push

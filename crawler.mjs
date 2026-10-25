@@ -1,16 +1,21 @@
 // Built from a private repository (agent-data-api jobs/crawler.ts + src/jobs). Do not edit.
 
 // jobs/crawler.ts
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { gzipSync } from "node:zlib";
 
 // src/jobs/ats.ts
 var ATS_NAMES = ["greenhouse", "lever", "ashby", "workable", "smartrecruiters", "recruitee", "bamboohr", "personio", "teamtailor", "workday"];
 var LOOKUP_ATS = ATS_NAMES.filter((a) => a !== "workday");
 var UA = { "user-agent": "company-jobs-tracker (Apify actor)", accept: "application/json" };
+var timeoutMs = 6e4;
+function setRequestTimeout(ms) {
+  timeoutMs = ms;
+}
 async function request(url, init = {}) {
   for (let attempt = 0; attempt < 3; attempt++) {
-    const res = await fetch(url, { ...init, headers: { ...UA, ...init.headers }, signal: AbortSignal.timeout(6e4) }).catch(() => null);
+    const res = await fetch(url, { ...init, headers: { ...UA, ...init.headers }, signal: AbortSignal.timeout(timeoutMs) }).catch(() => null);
     if (res?.ok) return res;
     if (res && res.status !== 429 && res.status < 500) return null;
     await new Promise((r) => setTimeout(r, 1e3 * 2 ** attempt));
@@ -521,51 +526,92 @@ var limitAt = args.indexOf("--limit");
 var limit = limitAt >= 0 ? Number(args[limitAt + 1]) : Infinity;
 var upload = !args.includes("--no-upload");
 var prune = args.includes("--prune");
-var PER_ATS = 8;
+var PER_ATS = { workable: 2 };
+var WORKERS = 8;
+var PACE_MS = { workable: 700 };
+var COOLDOWN_MS = 3e4;
+var RETRY_PAUSE_MS = 6e4;
+var FAIL_LIMIT = 3;
 var CRAWLED_ATS = ["greenhouse", "lever", "ashby", "workable", "smartrecruiters", "recruitee"];
+setRequestTimeout(2e4);
 var directory = JSON.parse(readFileSync(file, "utf8"));
 var boards = directory.boards.filter((b) => CRAWLED_ATS.includes(b.ats)).slice(0, limit);
 var started = Date.now();
 var lines = [];
 var status = {};
 var counts = { live: 0, gone: 0, error: 0, jobs: 0 };
-async function crawlAts(ats) {
-  const queue = boards.filter((b) => b.ats === ats);
+var sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+var nextStart = {};
+async function pace(ats, slower) {
+  const gap = PACE_MS[ats];
+  if (!gap) return;
+  const at = Math.max(Date.now(), nextStart[ats] ?? 0);
+  nextStart[ats] = at + gap * slower;
+  await sleep(at - Date.now());
+}
+async function crawlAts(ats, queue, workers, slower) {
   const worker = async () => {
     for (let b = queue.shift(); b; b = queue.shift()) {
+      const key = `${ats}:${b.slug}`;
+      await pace(ats, slower);
       try {
         const jobs = await fetchBoard({ ats: b.ats, board: b.slug }, false, 200);
         if (jobs === null) {
-          status[`${ats}:${b.slug}`] = "gone";
+          status[key] = "gone";
           counts.gone++;
           continue;
         }
-        status[`${ats}:${b.slug}`] = "live";
+        status[key] = "live";
         counts.live++;
         for (const j of jobs) {
           lines.push(JSON.stringify(compactJob(j)));
           counts.jobs++;
         }
       } catch {
-        status[`${ats}:${b.slug}`] = "error";
-        counts.error++;
+        status[key] = "error";
+        if (PACE_MS[ats]) nextStart[ats] = Math.max(nextStart[ats] ?? 0, Date.now() + COOLDOWN_MS);
       }
     }
   };
-  await Promise.all(Array.from({ length: PER_ATS }, worker));
-  console.log(`crawl: ${ats} done after ${Math.round((Date.now() - started) / 1e3)} s (${counts.jobs} jobs so far)`);
+  await Promise.all(Array.from({ length: workers }, worker));
 }
-await Promise.all(CRAWLED_ATS.map(crawlAts));
+await Promise.all(
+  CRAWLED_ATS.map(async (ats) => {
+    await crawlAts(ats, boards.filter((b) => b.ats === ats), PER_ATS[ats] ?? WORKERS, 1);
+    console.log(`crawl: ${ats} done after ${Math.round((Date.now() - started) / 1e3)} s (${counts.jobs} jobs so far)`);
+  })
+);
+var failed = boards.filter((b) => status[`${b.ats}:${b.slug}`] === "error");
+if (failed.length) {
+  console.log(`retry: ${failed.length} boards errored; second pass after ${RETRY_PAUSE_MS / 1e3} s`);
+  await sleep(RETRY_PAUSE_MS);
+  await Promise.all(CRAWLED_ATS.map((ats) => crawlAts(ats, failed.filter((b) => b.ats === ats), 2, 2)));
+}
+counts.error = boards.filter((b) => status[`${b.ats}:${b.slug}`] === "error").length;
+var errorsByAts = {};
+for (const b of boards) if (status[`${b.ats}:${b.slug}`] === "error") errorsByAts[b.ats] = (errorsByAts[b.ats] ?? 0) + 1;
 var crawledAt = (/* @__PURE__ */ new Date()).toISOString();
 var gz = gzipSync(lines.join("\n"));
 mkdirSync("out", { recursive: true });
 writeFileSync("out/jobs.jsonl.gz", gz);
 writeFileSync("out/status.json", JSON.stringify({ crawledAt, counts, status }));
-console.log(`crawl: ${boards.length} boards (${counts.live} live, ${counts.gone} gone, ${counts.error} errors), ${counts.jobs} jobs, ${(gz.length / 1e6).toFixed(1)} MB gzipped, ${Math.round((Date.now() - started) / 1e3)} s`);
-if (prune && counts.gone) {
-  const kept = directory.boards.filter((b) => status[`${b.ats}:${b.slug}`] !== "gone");
+console.log(`crawl: ${boards.length} boards (${counts.live} live, ${counts.gone} gone, ${counts.error} errors ${JSON.stringify(errorsByAts)}), ${counts.jobs} jobs, ${(gz.length / 1e6).toFixed(1)} MB gzipped, ${Math.round((Date.now() - started) / 1e3)} s`);
+if (prune) {
+  const dropped = [];
+  const kept = [];
+  for (const b of directory.boards) {
+    const st = status[`${b.ats}:${b.slug}`];
+    const fails = st === "error" ? (b.fails ?? 0) + 1 : st === "live" ? 0 : b.fails ?? 0;
+    if (st === "gone" || fails >= FAIL_LIMIT) dropped.push({ ats: b.ats, slug: b.slug });
+    else kept.push(fails ? { ats: b.ats, slug: b.slug, fails } : { ats: b.ats, slug: b.slug });
+  }
   writeFileSync(file, JSON.stringify({ ...directory, boards: kept }));
-  console.log(`prune: dropped ${directory.boards.length - kept.length} boards that no longer exist`);
+  const goneFile = join(dirname(file), "gone.json");
+  const gone = existsSync(goneFile) ? JSON.parse(readFileSync(goneFile, "utf8")).boards : [];
+  const known = new Set(gone.map((b) => `${b.ats}:${b.slug}`));
+  for (const b of dropped) if (!known.has(`${b.ats}:${b.slug}`)) gone.push(b);
+  writeFileSync(goneFile, JSON.stringify({ boards: gone }));
+  console.log(`prune: dropped ${dropped.length} boards (gone, or failed ${FAIL_LIMIT} crawls in a row); gone.json has ${gone.length}`);
 }
 if (upload) {
   const url = process.env.JOBS_UPLOAD_URL;

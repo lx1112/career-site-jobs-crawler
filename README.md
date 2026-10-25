@@ -7,9 +7,10 @@ job-board API, and uploads one snapshot of all open jobs.
 
 - `boards.json`: the directory of company boards, from [Common Crawl](https://commoncrawl.org)'s
   URL index (`directory.mjs`, monthly) and public lists on GitHub, merged by `merge-directory.mjs`.
-  Each crawl drops boards that no longer exist.
-- `crawler.mjs`: one request per board, a few boards per system at a time. Boards that no longer
-  exist are skipped.
+  Each crawl drops boards that no longer exist, or that failed three crawls in a row, and lists
+  them in `gone.json` so directory refreshes don't add them back.
+- `crawler.mjs`: one request per board, a few boards per system at a time, Workable paced to about
+  1.4 requests a second (its rate limit). Boards that errored get a second, slower pass.
 - `.github/workflows/`: the twice-daily crawl and the monthly directory refresh.
 
 `crawler.mjs` is a bundled build; its source lives in a private repository. Job postings are the
