@@ -3,7 +3,7 @@
 // jobs/crawler.ts
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { gzipSync } from "node:zlib";
+import { gunzipSync, gzipSync } from "node:zlib";
 
 // src/jobs/ats.ts
 var ATS_NAMES = ["greenhouse", "lever", "ashby", "workable", "smartrecruiters", "recruitee", "bamboohr", "personio", "teamtailor", "workday"];
@@ -518,6 +518,59 @@ function partsOf(gz2, size = PART_BYTES) {
   for (let i = 0; i < gz2.length; i += size) parts.push(gz2.subarray(i, i + size));
   return parts.length ? parts : [new Uint8Array(0)];
 }
+var jobKey = (j) => `${j.ats}:${j.board}:${j.jobId}`;
+var historyId = (crawledAt2) => crawledAt2.slice(0, 16).replace(":", "");
+function diffSnapshots(previous, current, status2) {
+  const board = (j) => `${j.ats}:${j.board}`;
+  const before = /* @__PURE__ */ new Map();
+  const prevBoards = /* @__PURE__ */ new Map();
+  for (const j of previous) {
+    before.set(jobKey(j), j);
+    prevBoards.set(board(j), (prevBoards.get(board(j)) ?? 0) + 1);
+  }
+  const counts2 = {};
+  const nowKeys = /* @__PURE__ */ new Set();
+  for (const j of current) {
+    nowKeys.add(jobKey(j));
+    counts2[board(j)] = (counts2[board(j)] ?? 0) + 1;
+  }
+  const events = [];
+  let opened = 0;
+  let closed = 0;
+  let boardsAdded = 0;
+  const added = /* @__PURE__ */ new Set();
+  for (const j of current) {
+    const b = board(j);
+    if (!prevBoards.has(b)) {
+      if (!added.has(b)) {
+        added.add(b);
+        boardsAdded++;
+        events.push({ e: "board-added", ats: j.ats, board: j.board, company: j.company, jobs: counts2[b] });
+      }
+      continue;
+    }
+    if (!before.has(jobKey(j))) {
+      events.push({ e: "open", ...j });
+      opened++;
+    }
+  }
+  let boardsGone = 0;
+  const skipped = /* @__PURE__ */ new Set();
+  for (const [b, n] of prevBoards) {
+    const st = status2[b];
+    if (st === "gone") {
+      const [ats, ...rest] = b.split(":");
+      events.push({ e: "board-gone", ats, board: rest.join(":"), jobs: n });
+      boardsGone++;
+    } else if (st !== "live") skipped.add(b);
+  }
+  for (const [k, j] of before) {
+    if (nowKeys.has(k) || status2[board(j)] !== "live") continue;
+    events.push({ e: "close", ats: j.ats, board: j.board, jobId: j.jobId, title: j.title, postedAt: j.postedAt });
+    closed++;
+  }
+  return { events, opened, closed, boardsAdded, boardsGone, boardsSkipped: skipped.size, counts: counts2 };
+}
 
 // jobs/crawler.ts
 var args = process.argv.slice(2);
@@ -628,6 +681,29 @@ if (upload) {
     }
     throw new Error(`upload ${path} failed`);
   };
+  try {
+    const auth = { authorization: `Bearer ${secret}` };
+    const prev = await fetch(`${url}/latest`, { headers: auth });
+    if (prev.ok) {
+      const pm = await prev.json();
+      const chunks = [];
+      for (let i = 0; i < pm.parts; i++) {
+        const r = await fetch(`${url}/${pm.date}/part/${i}`, { headers: auth });
+        if (!r.ok) throw new Error(`previous part ${i}: HTTP ${r.status}`);
+        chunks.push(Buffer.from(await r.arrayBuffer()));
+      }
+      const previous = gunzipSync(Buffer.concat(chunks)).toString("utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
+      const current = lines.map((l) => JSON.parse(l));
+      const d = diffSnapshots(previous, current, status);
+      const id = historyId(crawledAt);
+      const summary = { id, previous: pm.crawledAt, crawledAt, opened: d.opened, closed: d.closed, boardsAdded: d.boardsAdded, boardsGone: d.boardsGone, boardsSkipped: d.boardsSkipped, counts: d.counts };
+      await put(`history/${id}/events`, gzipSync(d.events.map((e) => JSON.stringify(e)).join("\n")), "application/gzip");
+      await put(`history/${id}/summary`, JSON.stringify(summary), "application/json");
+      console.log(`history: ${id} vs ${pm.crawledAt}: ${d.opened} opened, ${d.closed} closed, ${d.boardsAdded} boards added, ${d.boardsGone} gone, ${d.boardsSkipped} skipped`);
+    } else console.log(`history: no previous snapshot (HTTP ${prev.status}); skipped`);
+  } catch (e) {
+    console.error(`history: skipped: ${e.message}`);
+  }
   for (const [i, part] of parts.entries()) await put(`${date}/part/${i}`, part, "application/gzip");
   const manifest = { date, crawledAt, parts: parts.length, bytes: gz.length, jobs: counts.jobs, boards: counts.live };
   await put(`${date}/manifest`, JSON.stringify(manifest), "application/json");
