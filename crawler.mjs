@@ -591,9 +591,17 @@ function salaryInterval(raw) {
   if (/year|annual/.test(s)) return "year";
   return null;
 }
+var MAJOR = /* @__PURE__ */ new Set(["USD", "EUR", "GBP", "CAD", "AUD", "NZD", "CHF", "SGD"]);
+function correctedInterval(interval, min, max, currency) {
+  const top = Math.max(min ?? 0, max ?? 0);
+  if (!currency || !MAJOR.has(currency.toUpperCase())) return interval;
+  if (interval === "month" && top >= 2e4) return "year";
+  if (interval === "hour" && top >= 1e3) return "year";
+  return interval;
+}
 var isRemote = (j) => j.remote === true || /remote/i.test(`${j.location ?? ""} ${j.workplaceType ?? ""}`);
 function indexRow(j, id) {
-  const interval = salaryInterval(j.salaryInterval);
+  const interval = correctedInterval(salaryInterval(j.salaryInterval), j.salaryMin, j.salaryMax, j.salaryCurrency);
   const perYear = interval ? PER_YEAR[interval] : null;
   const yearly = (v) => v != null && perYear ? Math.round(v * perYear) : null;
   const tags = [isRemote(j) ? "remote" : "", j.ats, j.employmentType?.toLowerCase().replace(/[^a-z]/g, "") ?? "", j.salaryMin || j.salaryMax ? "salary" : ""];
@@ -675,6 +683,20 @@ function indexDiff(previous, current, status2) {
   const settled = (k) => ["live", "gone"].includes(status2[beforeBoard.get(k)]);
   const close = [...before].filter((k) => !now.has(k) && settled(k));
   return { open, close };
+}
+
+// src/jobs/profile.ts
+var ACTIVITY_BATCH = 2e3;
+function boardActivity(events) {
+  const by = /* @__PURE__ */ new Map();
+  for (const e of events) {
+    if (e.e !== "open" && e.e !== "close") continue;
+    const k = `${e.ats}:${e.board}`;
+    let b = by.get(k);
+    if (!b) by.set(k, b = { row: { ats: e.ats, board: e.board, opened: 0, closed: 0 }, opened: /* @__PURE__ */ new Set(), closed: /* @__PURE__ */ new Set() });
+    (e.e === "open" ? b.opened : b.closed).add(e.jobId);
+  }
+  return [...by.values()].map(({ row, opened, closed }) => ({ ...row, opened: opened.size, closed: closed.size }));
 }
 
 // jobs/crawler.ts
@@ -805,6 +827,17 @@ if (upload) {
       await put(`history/${id}/events`, gzipSync(d.events.map((e) => JSON.stringify(e)).join("\n")), "application/gzip");
       await put(`history/${id}/summary`, JSON.stringify(summary), "application/json");
       console.log(`history: ${id} vs ${pm.crawledAt}: ${d.opened} opened, ${d.closed} closed, ${d.boardsAdded} boards added, ${d.boardsGone} gone, ${d.boardsSkipped} skipped`);
+      try {
+        const rows = boardActivity(d.events);
+        for (let b = 0; b * ACTIVITY_BATCH < rows.length; b++) {
+          const body = { crawl: id, day: crawledAt.slice(0, 10), rows: rows.slice(b * ACTIVITY_BATCH, (b + 1) * ACTIVITY_BATCH) };
+          const res = await fetch(`${url}/activity`, { method: "POST", headers: { ...auth, "content-type": "application/json" }, body: JSON.stringify(body) });
+          if (!res.ok) throw new Error(`batch ${b}: HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
+        }
+        console.log(`activity: ${rows.length} boards`);
+      } catch (e) {
+        console.error(`activity: sync failed (run npm run jobs-activity-backfill): ${e.message}`);
+      }
       try {
         const x = indexDiff(previous, current, status);
         const seenAt = Date.parse(crawledAt);
