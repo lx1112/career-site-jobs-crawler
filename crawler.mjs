@@ -572,6 +572,111 @@ function diffSnapshots(previous, current, status2) {
   return { events, opened, closed, boardsAdded, boardsGone, boardsSkipped: skipped.size, counts: counts2 };
 }
 
+// src/jobs/search-index.ts
+var SYNC_BATCH = 500;
+var EPOCH = Date.UTC(2026, 0, 1);
+function rowId(seenAt, n) {
+  if (n < 0 || n >= 1e6) throw new Error("sequence out of range");
+  return Math.floor((seenAt - EPOCH) / 6e4) * 1e6 + n;
+}
+var PER_YEAR = { year: 1, month: 12, week: 52, day: 260, hour: 2080, once: null };
+function salaryInterval(raw) {
+  const s = (raw ?? "").toLowerCase();
+  if (!s) return null;
+  if (/time|one/.test(s)) return "once";
+  if (/hour/.test(s)) return "hour";
+  if (/day/.test(s)) return "day";
+  if (/week/.test(s)) return "week";
+  if (/month/.test(s)) return "month";
+  if (/year|annual/.test(s)) return "year";
+  return null;
+}
+var isRemote = (j) => j.remote === true || /remote/i.test(`${j.location ?? ""} ${j.workplaceType ?? ""}`);
+function indexRow(j, id) {
+  const interval = salaryInterval(j.salaryInterval);
+  const perYear = interval ? PER_YEAR[interval] : null;
+  const yearly = (v) => v != null && perYear ? Math.round(v * perYear) : null;
+  const tags = [isRemote(j) ? "remote" : "", j.ats, j.employmentType?.toLowerCase().replace(/[^a-z]/g, "") ?? "", j.salaryMin || j.salaryMax ? "salary" : ""];
+  return {
+    id,
+    key: jobKey(j),
+    title: j.title,
+    company: j.company,
+    place: [j.location, j.country].filter(Boolean).join(" | "),
+    tags: tags.filter(Boolean).join(" "),
+    ats: j.ats,
+    board: j.board,
+    department: j.department,
+    employment_type: j.employmentType,
+    location: j.location,
+    country: j.country,
+    remote: isRemote(j) ? 1 : 0,
+    salary_min: j.salaryMin,
+    salary_max: j.salaryMax,
+    salary_currency: j.salaryCurrency?.toUpperCase() ?? null,
+    salary_interval: interval,
+    salary_year_min: yearly(j.salaryMin),
+    salary_year_max: yearly(j.salaryMax),
+    posted_at: j.postedAt,
+    url: j.url
+  };
+}
+var INDEX_COLUMNS = [
+  "title",
+  "company",
+  "place",
+  "tags",
+  "key",
+  "ats",
+  "board",
+  "department",
+  "employment_type",
+  "location",
+  "country",
+  "remote",
+  "salary_min",
+  "salary_max",
+  "salary_currency",
+  "salary_interval",
+  "salary_year_min",
+  "salary_year_max",
+  "posted_at",
+  "url"
+];
+var INSERT_JOBS_SQL = `INSERT INTO jobs (rowid, ${INDEX_COLUMNS.join(", ")}) SELECT r.value ->> 'id', ` + INDEX_COLUMNS.map((c) => `r.value ->> '${c}'`).join(", ") + " FROM json_each(?1) r WHERE NOT EXISTS (SELECT 1 FROM job_ids i WHERE i.key = r.value ->> 'key')";
+var MAX_PLACES = 10;
+function mergeByKey(jobs) {
+  const byKey = /* @__PURE__ */ new Map();
+  for (const j of jobs) {
+    const k = jobKey(j);
+    const e = byKey.get(k);
+    if (!e) {
+      byKey.set(k, { job: { ...j }, locations: j.location ? [j.location] : [], countries: j.country ? [j.country] : [] });
+      continue;
+    }
+    if (j.location && !e.locations.includes(j.location)) e.locations.push(j.location);
+    if (j.country && !e.countries.includes(j.country)) e.countries.push(j.country);
+    if (j.remote === true) e.job.remote = true;
+    if (!e.job.workplaceType && j.workplaceType) e.job.workplaceType = j.workplaceType;
+  }
+  const list = (xs) => xs.length ? xs.slice(0, MAX_PLACES).join("; ") + (xs.length > MAX_PLACES ? `; +${xs.length - MAX_PLACES} more` : "") : null;
+  return [...byKey.values()].map(({ job, locations, countries }) => ({ ...job, location: list(locations), country: list(countries) }));
+}
+function indexDiff(previous, current, status2) {
+  const before = /* @__PURE__ */ new Set();
+  const beforeBoard = /* @__PURE__ */ new Map();
+  for (const j of previous) {
+    const k = jobKey(j);
+    before.add(k);
+    beforeBoard.set(k, `${j.ats}:${j.board}`);
+  }
+  const now = new Set(current.map(jobKey));
+  const open = mergeByKey(current.filter((j) => !before.has(jobKey(j))));
+  const settled = (k) => ["live", "gone"].includes(status2[beforeBoard.get(k)]);
+  const close = [...before].filter((k) => !now.has(k) && settled(k));
+  return { open, close };
+}
+
 // jobs/crawler.ts
 var args = process.argv.slice(2);
 var file = args.find((a) => !a.startsWith("--")) ?? "boards.json";
@@ -700,6 +805,22 @@ if (upload) {
       await put(`history/${id}/events`, gzipSync(d.events.map((e) => JSON.stringify(e)).join("\n")), "application/gzip");
       await put(`history/${id}/summary`, JSON.stringify(summary), "application/json");
       console.log(`history: ${id} vs ${pm.crawledAt}: ${d.opened} opened, ${d.closed} closed, ${d.boardsAdded} boards added, ${d.boardsGone} gone, ${d.boardsSkipped} skipped`);
+      try {
+        const x = indexDiff(previous, current, status);
+        const seenAt = Date.parse(crawledAt);
+        const open = x.open.map((j, i) => indexRow(j, rowId(seenAt, i)));
+        const batches = Math.max(Math.ceil(open.length / SYNC_BATCH), Math.ceil(x.close.length / SYNC_BATCH), 1);
+        let written = 0;
+        for (let b = 0; b < batches; b++) {
+          const body = { open: open.slice(b * SYNC_BATCH, (b + 1) * SYNC_BATCH), close: x.close.slice(b * SYNC_BATCH, (b + 1) * SYNC_BATCH), ...b === batches - 1 ? { synced: crawledAt } : {} };
+          const res = await fetch(`${url}/index`, { method: "POST", headers: { ...auth, "content-type": "application/json" }, body: JSON.stringify(body) });
+          if (!res.ok) throw new Error(`batch ${b}: HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
+          written += (await res.json()).written;
+        }
+        console.log(`index: ${x.open.length} added, ${x.close.length} removed in ${batches} batches, ${written} rows written`);
+      } catch (e) {
+        console.error(`index: sync failed (run npm run jobs-index-load to rebuild): ${e.message}`);
+      }
     } else console.log(`history: no previous snapshot (HTTP ${prev.status}); skipped`);
   } catch (e) {
     console.error(`history: skipped: ${e.message}`);
