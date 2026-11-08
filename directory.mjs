@@ -11,6 +11,14 @@ const SOURCES = [
   { ats: "workable", pattern: "apply.workable.com/*", slug: (p) => p[0] },
   { ats: "smartrecruiters", pattern: "jobs.smartrecruiters.com/*", slug: (p) => p[0] },
   { ats: "recruitee", pattern: "*.recruitee.com", slug: (_p, host) => host.split(".")[0] },
+  // Workday boards are tenant.wdN/site (src/jobs/ats.ts workdayParts); the site path is case-sensitive, so only the
+  // tenant is lowercased. URLs may carry a locale first (/en-US/site).
+  { ats: "workday", pattern: "*.myworkdayjobs.com", keepCase: true, slug: (p, host) => {
+    const m = host.toLowerCase().match(/^([\w-]+)\.(wd\d+)\.myworkdayjobs\.com$/);
+    const site = /^[a-z]{2}-[A-Z]{2}$/i.test(p[0] ?? "") ? p[1] : p[0];
+    if (!m || !site || /^(wday|ccx|api|login)$/i.test(site) || !/^[\w-]{1,80}$/.test(site)) return "";
+    return `${m[1]}.${m[2]}/${site}`;
+  } },
 ];
 const SKIP = new Set(["", "embed", "api", "v1", "jobs", "assets", "static", "favicon.ico", "robots.txt", "sitemap.xml", "careers", "j", "o", "oauth", "login", "search", "c", "www", "app", "cdn", "help", "support"]);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -58,8 +66,9 @@ for (const crawl of crawls) {
           continue;
         }
         const parts = u.pathname.split("/").filter(Boolean);
-        const slug = (src.slug(parts, u.hostname) ?? "").toLowerCase();
-        if (!slug || SKIP.has(slug) || !/^[a-z0-9][a-z0-9._-]{0,80}$/.test(slug)) continue;
+        const raw = src.slug(parts, u.hostname) ?? "";
+        const slug = src.keepCase ? raw : raw.toLowerCase();
+        if (!slug || (!src.keepCase && (SKIP.has(slug) || !/^[a-z0-9][a-z0-9._-]{0,80}$/.test(slug)))) continue;
         const key = `${src.ats}:${slug}`;
         if (!boards.has(key)) found++;
         boards.set(key, (boards.get(key) ?? 0) + 1);
@@ -76,7 +85,10 @@ console.log("boards by ATS:", by);
 
 function save() {
   mkdirSync("jobs/data", { recursive: true });
-  const list = [...boards.entries()].map(([k, hits]) => ({ ats: k.split(":")[0], slug: k.slice(k.indexOf(":") + 1), hits })).sort((a, b) => b.hits - a.hits);
+  // One Workday site per tenant (the most-crawled): a tenant's other sites are mostly internal or duplicate boards.
+  const tenants = new Set();
+  const list = [...boards.entries()].map(([k, hits]) => ({ ats: k.split(":")[0], slug: k.slice(k.indexOf(":") + 1), hits })).sort((a, b) => b.hits - a.hits)
+    .filter((b) => b.ats !== "workday" || (!tenants.has(b.slug.split("/")[0]) && tenants.add(b.slug.split("/")[0])));
   writeFileSync("jobs/data/boards-cc.json", JSON.stringify({ crawls, built: new Date().toISOString(), boards: list }));
   return list;
 }

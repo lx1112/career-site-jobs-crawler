@@ -489,6 +489,11 @@ async function fetchBoard(b, withDescription, limit2) {
   }
 }
 
+// src/jobs/lifecycle.ts
+var EPOCH = Date.UTC(2026, 0, 1);
+var f = (name) => `json_extract(j.value, '$.${name}')`;
+var LIFECYCLE_OPEN_SQL = `INSERT INTO job_lifecycle (key, ats, board, title_norm, first_seen, posted_at, pay_currency, pay_first_min, pay_first_max, pay_last_min, pay_last_max) SELECT ${f("k")}, ${f("a")}, ${f("b")}, ${f("t")}, ${f("s")}, ${f("p")}, ${f("c")}, ${f("mn")}, ${f("mx")}, ${f("mn")}, ${f("mx")} FROM json_each(?1) j WHERE true ON CONFLICT(key) DO UPDATE SET reopened = reopened + (closed_at IS NOT NULL), closed_at = NULL, pay_currency = coalesce(excluded.pay_currency, pay_currency), pay_last_min = excluded.pay_last_min, pay_last_max = excluded.pay_last_max`;
+
 // src/jobs/snapshot.ts
 var PART_BYTES = 20 * 1024 * 1024;
 function compactJob(j) {
@@ -574,10 +579,10 @@ function diffSnapshots(previous, current, status2) {
 
 // src/jobs/search-index.ts
 var SYNC_BATCH = 500;
-var EPOCH = Date.UTC(2026, 0, 1);
-function rowId(seenAt, n) {
+var EPOCH2 = Date.UTC(2026, 0, 1);
+function rowId(seenAt2, n) {
   if (n < 0 || n >= 1e6) throw new Error("sequence out of range");
-  return Math.floor((seenAt - EPOCH) / 6e4) * 1e6 + n;
+  return Math.floor((seenAt2 - EPOCH2) / 6e4) * 1e6 + n;
 }
 var PER_YEAR = { year: 1, month: 12, week: 52, day: 260, hour: 2080, once: null };
 function salaryInterval(raw) {
@@ -687,16 +692,63 @@ function indexDiff(previous, current, status2) {
 
 // src/jobs/profile.ts
 var ACTIVITY_BATCH = 2e3;
-function boardActivity(events) {
+
+// src/jobs/hiring-trend.ts
+var RULES = [
+  ["people", /\b(recruit\w*|talent|sourcer|human resources|hr|hrbp|people (ops|operations|partner|team)|payroll)\b/i],
+  ["legal", /\b(legal|counsel|attorney|lawyer|paralegal|compliance|privacy officer)\b/i],
+  ["finance", /\b(financ\w*|accountant|accounting|controller|tax|treasury|audit\w*|fp&a|bookkeep\w*|billing|payable|receivable|actuar\w*)\b/i],
+  ["sales", /\b(sales|account executive|business development|bdr|sdr|account manager|solutions? (engineer|consultant|architect)|pre-?sales|partnerships?|revenue|commercial)\b/i],
+  ["marketing", /\b(marketing|brand|growth|content|seo|communications|pr|social media|copywriter|demand gen\w*|community|events?)\b/i],
+  ["customer", /\b(customer|support|success|service desk|help ?desk|onboarding|implementation|client services?)\b/i],
+  ["design", /\b(design\w*|ux|ui|creative|illustrat\w*|art director|animator)\b/i],
+  ["data", /\b(data|machine learning|ml|ai|analytics|scientist|research(er)?|analyst|statistic\w*)\b/i],
+  ["product", /\b(product (manager|owner|lead|director|management|operations)|head of product|program manager|technical program)\b/i],
+  ["engineering", /\b(engineer\w*|developer|software|devops|sre|infrastructure|security|architect|qa|test\w*|firmware|hardware|it|sysadmin|network|technical|programmer|cto)\b/i],
+  ["healthcare", /\b(nurse|nursing|rn|lpn|physician|clinical|clinician|therap\w*|medical|pharmac\w*|dental|health\w*|caregiver|patient)\b/i],
+  ["operations", /\b(operations|ops|logistics|supply chain|warehouse|procurement|purchasing|facilit\w*|office|admin\w*|assistant|coordinator|project manager|driver|technician|manufactur\w*|production|store|retail|crew|associate)\b/i]
+];
+var FUNCTIONS = [...RULES.map(([f2]) => f2), "other"];
+function titleFunction(title) {
+  for (const [f2, re] of RULES) if (re.test(title)) return f2;
+  return "other";
+}
+function placeOf(location) {
+  const first = (location ?? "").split(/;|\|/)[0].trim();
+  if (!first || /^\+\d+ more$/.test(first) || /^(n\/?a|none|tbd|tba|various|multiple locations?|flexible|-+)$/i.test(first)) return null;
+  if (/\b(remote|anywhere|distributed|work from home|wfh)\b/i.test(first)) return "Remote";
+  const city = first.split(",")[0].replace(/\s*\(.*\)\s*$/, "").trim();
+  return city ? city.slice(0, 40) : null;
+}
+var remoteJob = (j) => j.remote === true || /remote/i.test(`${j.location ?? ""} ${j.workplaceType ?? ""}`);
+var MIX_PLACES = 8;
+function activityWithMix(events, closed = () => void 0) {
   const by = /* @__PURE__ */ new Map();
   for (const e of events) {
     if (e.e !== "open" && e.e !== "close") continue;
     const k = `${e.ats}:${e.board}`;
     let b = by.get(k);
-    if (!b) by.set(k, b = { row: { ats: e.ats, board: e.board, opened: 0, closed: 0 }, opened: /* @__PURE__ */ new Set(), closed: /* @__PURE__ */ new Set() });
-    (e.e === "open" ? b.opened : b.closed).add(e.jobId);
+    if (!b) by.set(k, b = { ats: e.ats, board: e.board, opened: /* @__PURE__ */ new Map(), closed: /* @__PURE__ */ new Map() });
+    if (e.e === "open") {
+      if (!b.opened.has(e.jobId)) b.opened.set(e.jobId, e);
+    } else if (!b.closed.has(e.jobId)) b.closed.set(e.jobId, e);
   }
-  return [...by.values()].map(({ row, opened, closed }) => ({ ...row, opened: opened.size, closed: closed.size }));
+  return [...by.values()].map((b) => {
+    const mix = { f: {}, l: {}, r: [0, 0] };
+    const add = (title, d, i) => {
+      const f2 = titleFunction(title);
+      (mix.f[f2] ??= [0, 0])[i]++;
+      if (!d) return;
+      const p = placeOf(d.location);
+      if (p) (mix.l[p] ??= [0, 0])[i]++;
+      if (remoteJob(d)) mix.r[i]++;
+    };
+    for (const e of b.opened.values()) add(e.title, e, 0);
+    for (const e of b.closed.values()) add(e.title, closed(`${b.ats}:${b.board}:${e.jobId}`), 1);
+    const places = Object.entries(mix.l).sort((x, y) => y[1][0] + y[1][1] - (x[1][0] + x[1][1]) || x[0].localeCompare(y[0]));
+    mix.l = Object.fromEntries(places.slice(0, MIX_PLACES));
+    return { ats: b.ats, board: b.board, opened: b.opened.size, closed: b.closed.size, mix };
+  });
 }
 
 // jobs/crawler.ts
@@ -706,13 +758,15 @@ var limitAt = args.indexOf("--limit");
 var limit = limitAt >= 0 ? Number(args[limitAt + 1]) : Infinity;
 var upload = !args.includes("--no-upload");
 var prune = args.includes("--prune");
-var PER_ATS = { workable: 2 };
+var PER_ATS = { workable: 2, workday: 4 };
 var WORKERS = 8;
 var PACE_MS = { workable: 700 };
 var COOLDOWN_MS = 3e4;
 var RETRY_PAUSE_MS = 6e4;
 var FAIL_LIMIT = 3;
-var CRAWLED_ATS = ["greenhouse", "lever", "ashby", "workable", "smartrecruiters", "recruitee"];
+var FAIL_LIMIT_BY_ATS = { workday: 10 };
+var CRAWLED_ATS = ["greenhouse", "lever", "ashby", "workable", "smartrecruiters", "recruitee", "workday"];
+var LIMIT = { smartrecruiters: 200, workday: 2e3 };
 setRequestTimeout(2e4);
 var directory = JSON.parse(readFileSync(file, "utf8"));
 var boards = directory.boards.filter((b) => CRAWLED_ATS.includes(b.ats)).slice(0, limit);
@@ -735,7 +789,7 @@ async function crawlAts(ats, queue, workers, slower) {
       const key = `${ats}:${b.slug}`;
       await pace(ats, slower);
       try {
-        const jobs = await fetchBoard({ ats: b.ats, board: b.slug }, false, 200);
+        const jobs = await fetchBoard({ ats: b.ats, board: b.slug }, false, LIMIT[ats] ?? 200);
         if (jobs === null) {
           status[key] = "gone";
           counts.gone++;
@@ -782,7 +836,7 @@ if (prune) {
   for (const b of directory.boards) {
     const st = status[`${b.ats}:${b.slug}`];
     const fails = st === "error" ? (b.fails ?? 0) + 1 : st === "live" ? 0 : b.fails ?? 0;
-    if (st === "gone" || fails >= FAIL_LIMIT) dropped.push({ ats: b.ats, slug: b.slug });
+    if (st === "gone" || fails >= (FAIL_LIMIT_BY_ATS[b.ats] ?? FAIL_LIMIT)) dropped.push({ ats: b.ats, slug: b.slug });
     else kept.push(fails ? { ats: b.ats, slug: b.slug, fails } : { ats: b.ats, slug: b.slug });
   }
   writeFileSync(file, JSON.stringify({ ...directory, boards: kept }));
@@ -828,7 +882,8 @@ if (upload) {
       await put(`history/${id}/summary`, JSON.stringify(summary), "application/json");
       console.log(`history: ${id} vs ${pm.crawledAt}: ${d.opened} opened, ${d.closed} closed, ${d.boardsAdded} boards added, ${d.boardsGone} gone, ${d.boardsSkipped} skipped`);
       try {
-        const rows = boardActivity(d.events);
+        const before = new Map(previous.map((j) => [jobKey(j), j]));
+        const rows = activityWithMix(d.events, (k) => before.get(k));
         for (let b = 0; b * ACTIVITY_BATCH < rows.length; b++) {
           const body = { crawl: id, day: crawledAt.slice(0, 10), rows: rows.slice(b * ACTIVITY_BATCH, (b + 1) * ACTIVITY_BATCH) };
           const res = await fetch(`${url}/activity`, { method: "POST", headers: { ...auth, "content-type": "application/json" }, body: JSON.stringify(body) });
@@ -840,8 +895,8 @@ if (upload) {
       }
       try {
         const x = indexDiff(previous, current, status);
-        const seenAt = Date.parse(crawledAt);
-        const open = x.open.map((j, i) => indexRow(j, rowId(seenAt, i)));
+        const seenAt2 = Date.parse(crawledAt);
+        const open = x.open.map((j, i) => indexRow(j, rowId(seenAt2, i)));
         const batches = Math.max(Math.ceil(open.length / SYNC_BATCH), Math.ceil(x.close.length / SYNC_BATCH), 1);
         let written = 0;
         for (let b = 0; b < batches; b++) {

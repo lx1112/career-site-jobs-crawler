@@ -2,7 +2,7 @@
 
 The daily crawler behind [Career Site Jobs Search](https://apify.com/lx112/career-site-jobs-search)
 on Apify. It reads the public job boards that companies publish on their applicant tracking system
-(Greenhouse, Lever, Ashby, Workable, SmartRecruiters and Recruitee), through each system's public
+(Greenhouse, Lever, Ashby, Workable, SmartRecruiters, Recruitee and Workday), through each system's public
 job-board API, and uploads one snapshot of all open jobs.
 
 - `boards.json`: the directory of company boards, from [Common Crawl](https://commoncrawl.org)'s
@@ -10,7 +10,8 @@ job-board API, and uploads one snapshot of all open jobs.
   Each crawl drops boards that no longer exist, or that failed three crawls in a row, and lists
   them in `gone.json` so directory refreshes don't add them back.
 - `crawler.mjs`: one request per board, a few boards per system at a time, Workable paced to about
-  1.4 requests a second (its rate limit). Boards that errored get a second, slower pass.
+  1.4 requests a second (its rate limit). Workday boards are paged 20 jobs at a time, up to the 2,000
+  Workday reports. Boards that errored get a second, slower pass.
 - `.github/workflows/`: the twice-daily crawl and the monthly directory refresh.
 
 `crawler.mjs` is a bundled build; its source lives in a private repository. Job postings are the
