@@ -1,7 +1,9 @@
 // Built from a private repository (agent-data-api jobs/crawler.ts + src/jobs). Do not edit.
 
 // jobs/crawler.ts
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { appendFileSync, createReadStream, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createInterface } from "node:readline";
 import { dirname, join } from "node:path";
 import { gunzipSync, gzipSync } from "node:zlib";
 
@@ -390,29 +392,40 @@ function workdayPosted(text) {
   const d = new Date(Date.now() - days * 864e5);
   return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate())).toISOString();
 }
-async function workday(board, withDescription, limit2) {
+async function workday(board, withDescription, limit2, searchTexts = []) {
   const { tenant, api, site } = workdayParts(board);
-  const page = async (offset) => await getJson(`${api}/jobs`, {
+  const page = async (offset, searchText) => await getJson(`${api}/jobs`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ appliedFacets: {}, limit: 20, offset, searchText: "" })
+    body: JSON.stringify({ appliedFacets: {}, limit: 20, offset, searchText })
   });
-  const first = await page(0);
-  if (!first) return null;
-  const raw = [...first.jobPostings ?? []];
-  const total = first.total ?? Infinity;
-  let more = raw.length === 20;
-  for (let offset = 20; more && offset < Math.min(limit2, total); offset += 100) {
-    const offsets = [0, 20, 40, 60, 80].map((d) => offset + d).filter((o) => o < Math.min(limit2, total));
-    for (const p of await Promise.all(offsets.map(page))) {
-      const postings = p?.jobPostings ?? [];
-      raw.push(...postings);
-      if (postings.length < 20) {
-        more = false;
-        break;
+  const list = async (searchText) => {
+    const first = await page(0, searchText);
+    if (!first) return null;
+    const out = [...first.jobPostings ?? []];
+    const total = Math.min(first.total ?? Infinity, WORKDAY_CAP);
+    let more = out.length === 20;
+    for (let offset = 20; more && offset < Math.min(limit2, total); offset += 100) {
+      const offsets = [0, 20, 40, 60, 80].map((d) => offset + d).filter((o) => o < Math.min(limit2, total));
+      for (const p of await Promise.all(offsets.map((o) => page(o, searchText)))) {
+        const postings = p?.jobPostings ?? [];
+        out.push(...postings);
+        if (postings.length < 20) {
+          more = false;
+          break;
+        }
       }
     }
-  }
+    return out;
+  };
+  const lists = [];
+  for (const t of searchTexts.length ? searchTexts : [""]) lists.push(await list(t));
+  if (lists.every((l) => l === null)) return null;
+  const seenPaths = /* @__PURE__ */ new Set();
+  const raw = lists.flatMap((l) => l ?? []).filter((j) => {
+    const key = j.externalPath ?? JSON.stringify(j);
+    return !seenPaths.has(key) && seenPaths.add(key);
+  });
   const paths = /* @__PURE__ */ new Map();
   const jobs = raw.slice(0, limit2).map((j) => {
     const path = j.externalPath ?? "";
@@ -464,7 +477,8 @@ async function workday(board, withDescription, limit2) {
   }
   return jobs;
 }
-async function fetchBoard(b, withDescription, limit2) {
+var WORKDAY_CAP = 2e3;
+async function fetchBoard(b, withDescription, limit2, searchTexts = []) {
   switch (b.ats) {
     case "greenhouse":
       return greenhouse(b.board, withDescription);
@@ -485,14 +499,291 @@ async function fetchBoard(b, withDescription, limit2) {
     case "teamtailor":
       return teamtailor(b.board, withDescription);
     case "workday":
-      return workday(b.board, withDescription, limit2);
+      return workday(b.board, withDescription, limit2, searchTexts);
   }
 }
 
+// src/jobs/content.ts
+var DESCRIBED_ATS = ["greenhouse", "lever", "ashby", "workable", "recruitee"];
+var w = (re) => new RegExp(`(?<![A-Za-z0-9+#.])(?:${re})(?![A-Za-z0-9+#])`, "i");
+var cs = (re) => new RegExp(`(?<![A-Za-z0-9+#.])(?:${re})(?![A-Za-z0-9+#])`);
+var LANGS = "Python|Java|Rust|C\\+\\+|Kotlin|TypeScript|Ruby|Scala|JavaScript|PHP";
+var SKILLS = [
+  // languages
+  ["python", w("python")],
+  ["javascript", w("javascript")],
+  ["typescript", w("typescript")],
+  ["java", cs("Java")],
+  ["csharp", w("c#|\\.net|dotnet")],
+  ["cpp", w("c\\+\\+")],
+  ["go", cs(`[Gg]olang|(?:${LANGS})(?:,| or| and|/) ?Go|Go(?:,|/| or| and) (?:${LANGS})`)],
+  ["rust", cs("Rust")],
+  ["ruby", w("ruby on rails|ruby")],
+  ["php", w("php")],
+  ["swift", cs("SwiftUI|Swift(?:,|/| and| or| \\d| programming| developers?| code)|Objective-C")],
+  ["kotlin", w("kotlin")],
+  ["scala", cs("Scala")],
+  ["sql", w("sql")],
+  ["elixir", w("elixir")],
+  ["solidity", w("solidity")],
+  // frontend and mobile
+  ["react", cs("React(?:\\.js|JS)?|ReactJS|react\\.js|reactjs")],
+  ["react-native", w("react native")],
+  ["angular", w("angular(?:js)?")],
+  ["vue", cs("Vue(?:\\.js|JS|js| ?[23])|VueJS|vue\\.js|vuejs")],
+  ["nextjs", w("next\\.js|nextjs")],
+  ["nodejs", w("node\\.js|nodejs")],
+  ["flutter", w("flutter")],
+  ["ios", cs("iOS")],
+  ["android", w("android")],
+  // backend, data stores, messaging
+  ["django", w("django")],
+  ["rails", w("rails")],
+  ["spring", w("spring boot|spring framework")],
+  ["graphql", w("graphql")],
+  ["postgres", w("postgres(?:ql)?")],
+  ["mysql", w("mysql")],
+  ["mongodb", w("mongodb|mongo db")],
+  ["redis", w("redis")],
+  ["elasticsearch", w("elasticsearch|opensearch")],
+  ["kafka", w("kafka")],
+  ["rabbitmq", w("rabbitmq")],
+  ["dynamodb", w("dynamodb")],
+  // cloud and infrastructure
+  ["aws", cs("AWS|Amazon Web Services")],
+  ["gcp", cs("GCP|Google Cloud")],
+  ["azure", w("azure")],
+  ["kubernetes", w("kubernetes|k8s")],
+  ["docker", w("docker")],
+  ["terraform", w("terraform")],
+  ["ansible", w("ansible")],
+  ["linux", w("linux")],
+  ["cloudflare", w("cloudflare")],
+  ["datadog", w("datadog")],
+  ["grafana", w("grafana")],
+  ["jenkins", w("jenkins")],
+  ["github-actions", w("github actions")],
+  // data and analytics
+  ["snowflake", w("snowflake")],
+  ["databricks", w("databricks")],
+  ["bigquery", w("bigquery")],
+  ["redshift", w("redshift")],
+  ["dbt", cs("dbt")],
+  ["airflow", w("airflow")],
+  ["spark", cs("Spark|PySpark")],
+  ["tableau", w("tableau")],
+  ["power-bi", w("power ?bi")],
+  ["looker", w("looker")],
+  ["excel", cs("(?:Microsoft|MS|[Aa]dvanced|in|with|and|using) Excel|Excel (?:skills|spreadsheets?|models?|modeling|formulas|and|or)")],
+  ["pandas", w("pandas")],
+  // machine learning
+  ["machine-learning", w("machine learning")],
+  ["llm", w("llms?|large language models?|generative ai|genai")],
+  ["pytorch", w("pytorch")],
+  ["tensorflow", w("tensorflow")],
+  ["openai", w("openai")],
+  ["anthropic", cs("Anthropic|Claude Code|Claude AI")],
+  ["langchain", w("langchain")],
+  ["hugging-face", w("hugging ?face")],
+  ["computer-vision", w("computer vision")],
+  ["nlp", cs("NLP")],
+  // business systems
+  ["salesforce", w("salesforce|sfdc")],
+  ["hubspot", w("hubspot")],
+  ["marketo", w("marketo")],
+  ["outreach", cs("Outreach\\.io")],
+  ["gong", cs("Gong")],
+  ["zendesk", w("zendesk")],
+  ["intercom", cs("Intercom")],
+  ["sap", cs("SAP")],
+  ["netsuite", w("netsuite")],
+  ["workday", cs("Workday")],
+  ["quickbooks", w("quickbooks")],
+  ["oracle", cs("Oracle")],
+  ["servicenow", w("servicenow")],
+  ["jira", w("jira")],
+  ["shopify", w("shopify")],
+  ["stripe", cs("Stripe")],
+  ["google-analytics", w("google analytics|ga4")],
+  ["google-ads", w("google ads|adwords")],
+  // design and product
+  ["figma", w("figma")],
+  ["adobe-creative", w("photoshop|illustrator|adobe creative|indesign")],
+  ["autocad", w("autocad")],
+  ["solidworks", w("solidworks")],
+  // security, compliance, methods
+  ["soc2", w("soc ?2")],
+  ["hipaa", cs("HIPAA")],
+  ["gdpr", cs("GDPR")],
+  ["pci", cs("PCI(?:[ -]DSS)?")],
+  ["iso27001", w("iso ?27001")],
+  ["agile", w("agile|scrum")],
+  ["ci-cd", w("ci/cd|continuous integration")],
+  // crypto
+  ["blockchain", w("blockchain|web3")],
+  ["ethereum", w("ethereum")],
+  ["solana", cs("Solana")],
+  ["defi", cs("DeFi")]
+];
+function skillsIn(text) {
+  const t = text.length > 2e4 ? text.slice(0, 2e4) : text;
+  const out = [];
+  for (const [name, re] of SKILLS) if (re.test(t)) out.push(name);
+  return out;
+}
+var SENIORITY = [
+  ["intern", /\b(intern(ship)?|working student|werkstudent|apprentice|trainee|co-?op)\b/i],
+  ["executive", /\b(chief|c[efotmpr]o|vp|vice president|svp|evp|head of|general manager|president)\b/i],
+  ["director", /\bdirector\b/i],
+  ["manager", /\b(manager|supervisor|team lead)\b/i],
+  ["principal", /\b(principal|staff|distinguished|fellow|architect)\b/i],
+  ["senior", /\b(senior|sr\.?|lead|expert|iii|iv)\b/i],
+  ["junior", /\b(junior|jr\.?|entry[- ]level|graduate|associate|assistant|i)\b/i]
+];
+function seniorityOf(title) {
+  for (const [level, re] of SENIORITY) if (re.test(title)) return level;
+  return "mid";
+}
+function yearsOf(text) {
+  let min = null;
+  for (const m of text.slice(0, 2e4).matchAll(/\b(\d{1,2})\s*(?:\+|\s*(?:-|–|to)\s*\d{1,2})?\s*(?:years?|yrs?)\b(?!\s*old)/gi)) {
+    const n = Number(m[1]);
+    if (n >= 1 && n <= 20 && (min === null || n < min)) min = n;
+  }
+  return min;
+}
+var CONTENT_BATCH = 500;
+function contentFacts(title, description, own = []) {
+  const mine = new Set(own.map((o) => o.toLowerCase().replace(/[^a-z0-9]/g, "")));
+  const skills = skillsIn(`${title}
+${description}`).filter((s) => !mine.has(s.replace(/[^a-z0-9]/g, "")));
+  return { n: description.length, l: seniorityOf(title), y: yearsOf(description), sk: skills.join(",") };
+}
+var f = (name) => `j.value ->> '${name}'`;
+var CONTENT_INSERT_SQL = `INSERT OR IGNORE INTO job_content (key, seen, hash, len, seniority, years, skills) SELECT ${f("k")}, ${f("s")}, ${f("h")}, ${f("n")}, ${f("l")}, ${f("y")}, ${f("sk")} FROM json_each(?1) j WHERE ${f("k")} IS NOT NULL`;
+var NOT_A_COMPANY = /* @__PURE__ */ new Set([
+  "gmail.com",
+  "outlook.com",
+  "hotmail.com",
+  "yahoo.com",
+  "icloud.com",
+  "linkedin.com",
+  "facebook.com",
+  "twitter.com",
+  "x.com",
+  "instagram.com",
+  "youtube.com",
+  "youtu.be",
+  "tiktok.com",
+  "glassdoor.com",
+  "indeed.com",
+  "google.com",
+  "goo.gl",
+  "bit.ly",
+  "zoom.us",
+  "apple.com",
+  "microsoft.com",
+  "github.com",
+  "medium.com",
+  "notion.so",
+  "notion.site",
+  "calendly.com",
+  "vimeo.com",
+  "wikipedia.org",
+  "w3.org",
+  "schema.org",
+  "amazonaws.com",
+  "cloudfront.net",
+  "website-files.com",
+  "webflow.io",
+  "squarespace.com",
+  "wixsite.com",
+  "greenhouse.io",
+  "lever.co",
+  "ashbyhq.com",
+  "workable.com",
+  "recruitee.com",
+  "smartrecruiters.com",
+  "myworkdayjobs.com",
+  "bamboohr.com",
+  "personio.com",
+  "teamtailor.com",
+  "eeoc.gov",
+  "dol.gov",
+  "e-verify.gov",
+  "uscis.gov",
+  "dhs.gov",
+  "justice.gov",
+  "ssa.gov",
+  "gov.uk",
+  "europa.eu",
+  "typeform.com",
+  "docusign.com",
+  "adobe.com",
+  "hirevue.com",
+  "checkr.com",
+  "sterlingcheck.com"
+]);
+var TWO_LEVEL = /\.(co|com|org|net|gov|ac|edu)\.[a-z]{2}$/;
+function siteOf(host) {
+  const h = host.toLowerCase().replace(/\.$/, "");
+  if (!/^[a-z0-9.-]+\.[a-z]{2,}$/.test(h)) return null;
+  const labels = h.split(".");
+  const site = labels.slice(TWO_LEVEL.test(h) ? -3 : -2).join(".");
+  return NOT_A_COMPANY.has(site) ? null : site;
+}
+function sitesIn(text) {
+  const out = /* @__PURE__ */ new Set();
+  for (const m of text.slice(0, 3e4).matchAll(/(?:https?:\/\/|www\.|@)([a-z0-9][a-z0-9.-]{1,80}\.[a-z]{2,24})/gi)) {
+    const site = siteOf(m[1]);
+    if (site) out.add(site);
+  }
+  return [...out];
+}
+var AGENCY_PHRASE = /\b(our client|on behalf of (our|a|the) client|for (one of )?our clients?|client of ours|our clients are)\b/i;
+var AGENCY_NAME = /\b(staffing|recruit(ment|ing|ers?)|talent (solutions|partners|group)|personnel|headhunt\w*|executive search|search (partners|group)|employment (agency|services)|workforce solutions)\b/i;
+var AGENCY_SHARE = 0.15;
+var AGENCY_MIN_DESCRIBED = 5;
+var newTally = (company) => ({ company, jobs: 0, described: 0, agency: 0, sites: /* @__PURE__ */ new Map() });
+function tally(t, description) {
+  t.jobs++;
+  if (!description) return;
+  t.described++;
+  if (AGENCY_PHRASE.test(description)) t.agency++;
+  for (const s of sitesIn(description)) t.sites.set(s, (t.sites.get(s) ?? 0) + 1);
+}
+var squash = (s) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+function identityOf(ats, board, t) {
+  let best = null;
+  const names = [squash(board), squash(t.company)].filter((n) => n.length >= 3);
+  for (const [site, n] of t.sites) {
+    const label = squash(site.split(".")[0]);
+    const named = label.length >= 3 && names.some((x) => x.includes(label) || label.includes(x));
+    const ok = named || n >= 2 && n >= 0.2 * t.described;
+    if (!ok) continue;
+    const score = n + (named ? t.described : 0);
+    if (!best || score > best[1]) best = [site, score];
+  }
+  const domain = best?.[0] ?? null;
+  const staffing = AGENCY_NAME.test(t.company) || t.described >= AGENCY_MIN_DESCRIBED && t.agency >= AGENCY_SHARE * t.described;
+  return {
+    a: ats,
+    b: board,
+    c: t.company.slice(0, 200),
+    d: domain,
+    ds: domain && t.described ? Math.round((t.sites.get(domain) ?? 0) / t.described * 100) / 100 : null,
+    st: staffing ? 1 : 0,
+    de: t.described,
+    n: t.jobs
+  };
+}
+var IDENTITY_BATCH = 500;
+var IDENTITY_UPSERT_SQL = `INSERT INTO board_identity (ats, board, company, domain, domain_share, staffing, described, jobs, first_day, updated_day) SELECT ${f("a")}, ${f("b")}, ${f("c")}, ${f("d")}, ${f("ds")}, ${f("st")}, ${f("de")}, ${f("n")}, ?2, ?2 FROM json_each(?1) j WHERE ${f("a")} IS NOT NULL AND ${f("b")} IS NOT NULL ON CONFLICT(ats, board) DO UPDATE SET company = excluded.company, domain = coalesce(excluded.domain, domain), domain_share = CASE WHEN excluded.domain IS NULL THEN domain_share ELSE excluded.domain_share END, staffing = CASE WHEN excluded.staffing = 1 OR excluded.described < ${AGENCY_MIN_DESCRIBED} THEN max(staffing, excluded.staffing) ELSE 0 END, described = excluded.described, jobs = excluded.jobs, updated_day = excluded.updated_day`;
+
 // src/jobs/lifecycle.ts
 var EPOCH = Date.UTC(2026, 0, 1);
-var f = (name) => `json_extract(j.value, '$.${name}')`;
-var LIFECYCLE_OPEN_SQL = `INSERT INTO job_lifecycle (key, ats, board, title_norm, first_seen, posted_at, pay_currency, pay_first_min, pay_first_max, pay_last_min, pay_last_max) SELECT ${f("k")}, ${f("a")}, ${f("b")}, ${f("t")}, ${f("s")}, ${f("p")}, ${f("c")}, ${f("mn")}, ${f("mx")}, ${f("mn")}, ${f("mx")} FROM json_each(?1) j WHERE true ON CONFLICT(key) DO UPDATE SET reopened = reopened + (closed_at IS NOT NULL), closed_at = NULL, pay_currency = coalesce(excluded.pay_currency, pay_currency), pay_last_min = excluded.pay_last_min, pay_last_max = excluded.pay_last_max`;
+var f2 = (name) => `json_extract(j.value, '$.${name}')`;
+var LIFECYCLE_OPEN_SQL = `INSERT INTO job_lifecycle (key, ats, board, title_norm, first_seen, posted_at, pay_currency, pay_first_min, pay_first_max, pay_last_min, pay_last_max) SELECT ${f2("k")}, ${f2("a")}, ${f2("b")}, ${f2("t")}, ${f2("s")}, ${f2("p")}, ${f2("c")}, ${f2("mn")}, ${f2("mx")}, ${f2("mn")}, ${f2("mx")} FROM json_each(?1) j WHERE true ON CONFLICT(key) DO UPDATE SET reopened = reopened + (closed_at IS NOT NULL), closed_at = NULL, pay_currency = coalesce(excluded.pay_currency, pay_currency), pay_last_min = excluded.pay_last_min, pay_last_max = excluded.pay_last_max`;
 
 // src/jobs/snapshot.ts
 var PART_BYTES = 20 * 1024 * 1024;
@@ -708,9 +999,9 @@ var RULES = [
   ["healthcare", /\b(nurse|nursing|rn|lpn|physician|clinical|clinician|therap\w*|medical|pharmac\w*|dental|health\w*|caregiver|patient)\b/i],
   ["operations", /\b(operations|ops|logistics|supply chain|warehouse|procurement|purchasing|facilit\w*|office|admin\w*|assistant|coordinator|project manager|driver|technician|manufactur\w*|production|store|retail|crew|associate)\b/i]
 ];
-var FUNCTIONS = [...RULES.map(([f2]) => f2), "other"];
+var FUNCTIONS = [...RULES.map(([f3]) => f3), "other"];
 function titleFunction(title) {
-  for (const [f2, re] of RULES) if (re.test(title)) return f2;
+  for (const [f3, re] of RULES) if (re.test(title)) return f3;
   return "other";
 }
 function placeOf(location) {
@@ -736,8 +1027,8 @@ function activityWithMix(events, closed = () => void 0) {
   return [...by.values()].map((b) => {
     const mix = { f: {}, l: {}, r: [0, 0] };
     const add = (title, d, i) => {
-      const f2 = titleFunction(title);
-      (mix.f[f2] ??= [0, 0])[i]++;
+      const f3 = titleFunction(title);
+      (mix.f[f3] ??= [0, 0])[i]++;
       if (!d) return;
       const p = placeOf(d.location);
       if (p) (mix.l[p] ??= [0, 0])[i]++;
@@ -768,9 +1059,33 @@ var FAIL_LIMIT_BY_ATS = { workday: 10 };
 var CRAWLED_ATS = ["greenhouse", "lever", "ashby", "workable", "smartrecruiters", "recruitee", "workday"];
 var LIMIT = { smartrecruiters: 200, workday: 2e3 };
 setRequestTimeout(2e4);
+var withContent = process.env.JOBS_CONTENT !== "0";
+var facts = /* @__PURE__ */ new Map();
+var tallies = /* @__PURE__ */ new Map();
+var TEXT_FILE = "out/text-all.jsonl";
+var textBuffer = [];
+var flushText = () => {
+  if (textBuffer.length) appendFileSync(TEXT_FILE, textBuffer.join("\n") + "\n");
+  textBuffer = [];
+};
+function recordContent(boardKey, jobs) {
+  if (!jobs.length) return;
+  const t = newTally(jobs[0].company);
+  for (const j of jobs) {
+    tally(t, j.description);
+    if (!j.description) continue;
+    const k = jobKey(compactJob(j));
+    facts.set(k, { h: createHash("sha256").update(j.description).digest("hex").slice(0, 16), ...contentFacts(j.title, j.description, [j.company, j.board]) });
+    textBuffer.push(JSON.stringify({ k, t: j.description }));
+  }
+  tallies.set(boardKey, t);
+  if (textBuffer.length >= 2e3) flushText();
+}
 var directory = JSON.parse(readFileSync(file, "utf8"));
 var boards = directory.boards.filter((b) => CRAWLED_ATS.includes(b.ats)).slice(0, limit);
 var started = Date.now();
+mkdirSync("out", { recursive: true });
+rmSync(TEXT_FILE, { force: true });
 var lines = [];
 var status = {};
 var counts = { live: 0, gone: 0, error: 0, jobs: 0 };
@@ -789,7 +1104,7 @@ async function crawlAts(ats, queue, workers, slower) {
       const key = `${ats}:${b.slug}`;
       await pace(ats, slower);
       try {
-        const jobs = await fetchBoard({ ats: b.ats, board: b.slug }, false, LIMIT[ats] ?? 200);
+        const jobs = await fetchBoard({ ats: b.ats, board: b.slug }, withContent && DESCRIBED_ATS.includes(ats), LIMIT[ats] ?? 200);
         if (jobs === null) {
           status[key] = "gone";
           counts.gone++;
@@ -800,6 +1115,11 @@ async function crawlAts(ats, queue, workers, slower) {
         for (const j of jobs) {
           lines.push(JSON.stringify(compactJob(j)));
           counts.jobs++;
+        }
+        try {
+          recordContent(key, jobs);
+        } catch (e) {
+          console.error(`content: ${key}: ${e.message}`);
         }
       } catch {
         status[key] = "error";
@@ -824,11 +1144,13 @@ if (failed.length) {
 counts.error = boards.filter((b) => status[`${b.ats}:${b.slug}`] === "error").length;
 var errorsByAts = {};
 for (const b of boards) if (status[`${b.ats}:${b.slug}`] === "error") errorsByAts[b.ats] = (errorsByAts[b.ats] ?? 0) + 1;
+flushText();
 var crawledAt = (/* @__PURE__ */ new Date()).toISOString();
 var gz = gzipSync(lines.join("\n"));
 mkdirSync("out", { recursive: true });
 writeFileSync("out/jobs.jsonl.gz", gz);
 writeFileSync("out/status.json", JSON.stringify({ crawledAt, counts, status }));
+console.log(`content: ${facts.size} postings with a description on ${tallies.size} boards`);
 console.log(`crawl: ${boards.length} boards (${counts.live} live, ${counts.gone} gone, ${counts.error} errors ${JSON.stringify(errorsByAts)}), ${counts.jobs} jobs, ${(gz.length / 1e6).toFixed(1)} MB gzipped, ${Math.round((Date.now() - started) / 1e3)} s`);
 if (prune) {
   const dropped = [];
@@ -906,6 +1228,45 @@ if (upload) {
           written += (await res.json()).written;
         }
         console.log(`index: ${x.open.length} added, ${x.close.length} removed in ${batches} batches, ${written} rows written`);
+        try {
+          const seen = Math.floor(seenAt2 / 1e3);
+          const fresh = new Set(x.open.map(jobKey));
+          const rows = [];
+          for (const k of fresh) {
+            const c = facts.get(k);
+            if (c) rows.push({ k, s: seen, ...c });
+          }
+          let stored = 0;
+          for (let b = 0; b * CONTENT_BATCH < rows.length; b++) {
+            const res = await fetch(`${url}/content`, { method: "POST", headers: { ...auth, "content-type": "application/json" }, body: JSON.stringify({ rows: rows.slice(b * CONTENT_BATCH, (b + 1) * CONTENT_BATCH) }) });
+            if (!res.ok) throw new Error(`content batch ${b}: HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
+            stored += (await res.json()).written;
+          }
+          console.log(`content: ${rows.length} of ${fresh.size} new postings have a description; ${stored} rows written`);
+          if (rows.length && existsSync(TEXT_FILE)) {
+            const PART_CHARS = 4e7;
+            let part = [];
+            let chars = 0;
+            let parts2 = 0;
+            const send = async () => {
+              if (!part.length) return;
+              await put(`text/${id}/part/${parts2++}`, gzipSync(part.join("\n")), "application/gzip");
+              part = [];
+              chars = 0;
+            };
+            for await (const line of createInterface({ input: createReadStream(TEXT_FILE), crlfDelay: Infinity })) {
+              const at = line.indexOf('","t":');
+              if (at < 6 || !fresh.has(JSON.parse(line.slice(5, at + 1)))) continue;
+              part.push(line);
+              chars += line.length;
+              if (chars >= PART_CHARS) await send();
+            }
+            await send();
+            console.log(`text: ${parts2} parts for ${id}`);
+          }
+        } catch (e) {
+          console.error(`content: sync failed (this crawl's new postings keep no content): ${e.message}`);
+        }
       } catch (e) {
         console.error(`index: sync failed (run npm run jobs-index-load to rebuild): ${e.message}`);
       }
@@ -913,8 +1274,19 @@ if (upload) {
   } catch (e) {
     console.error(`history: skipped: ${e.message}`);
   }
+  try {
+    const rows = [...tallies].map(([key, t]) => identityOf(key.slice(0, key.indexOf(":")), key.slice(key.indexOf(":") + 1), t));
+    for (let b = 0; b * IDENTITY_BATCH < rows.length; b++) {
+      const res = await fetch(`${url}/identity`, { method: "POST", headers: { authorization: `Bearer ${secret}`, "content-type": "application/json" }, body: JSON.stringify({ day: date, rows: rows.slice(b * IDENTITY_BATCH, (b + 1) * IDENTITY_BATCH) }) });
+      if (!res.ok) throw new Error(`batch ${b}: HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
+    }
+    console.log(`identity: ${rows.length} boards, ${rows.filter((r) => r.d).length} with a domain, ${rows.filter((r) => r.st).length} staffing`);
+  } catch (e) {
+    console.error(`identity: sync failed: ${e.message}`);
+  }
   for (const [i, part] of parts.entries()) await put(`${date}/part/${i}`, part, "application/gzip");
   const manifest = { date, crawledAt, parts: parts.length, bytes: gz.length, jobs: counts.jobs, boards: counts.live };
   await put(`${date}/manifest`, JSON.stringify(manifest), "application/json");
   console.log(`upload: ${parts.length} parts, manifest for ${date}`);
 }
+rmSync(TEXT_FILE, { force: true });
