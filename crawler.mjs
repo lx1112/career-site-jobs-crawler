@@ -8,7 +8,7 @@ import { dirname, join } from "node:path";
 import { gunzipSync, gzipSync } from "node:zlib";
 
 // src/jobs/ats.ts
-var ATS_NAMES = ["greenhouse", "lever", "ashby", "workable", "smartrecruiters", "recruitee", "bamboohr", "personio", "teamtailor", "workday"];
+var ATS_NAMES = ["greenhouse", "lever", "ashby", "workable", "smartrecruiters", "recruitee", "bamboohr", "personio", "teamtailor", "rippling", "gem", "breezy", "pinpoint", "workday"];
 var LOOKUP_ATS = ATS_NAMES.filter((a) => a !== "workday");
 var UA = { "user-agent": "company-jobs-tracker (Apify actor)", accept: "application/json" };
 var timeoutMs = 6e4;
@@ -26,7 +26,18 @@ async function request(url, init = {}) {
 }
 async function getJson(url, init) {
   const res = await request(url, init);
-  return res ? res.json().catch(() => null) : null;
+  if (!res) return null;
+  const text = await res.text().catch((e) => {
+    throw new Error(`Job board read failed: ${url}: ${e.message}`);
+  });
+  return parseJsonOrNull(text);
+}
+function parseJsonOrNull(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
 }
 async function getText(url, accept) {
   const res = await request(url, { headers: { accept } });
@@ -477,6 +488,121 @@ async function workday(board, withDescription, limit2, searchTexts = []) {
   }
   return jobs;
 }
+async function rippling(board) {
+  const data = await getJson(`https://api.rippling.com/platform/api/ats/v1/board/${encodeURIComponent(board)}/jobs`);
+  if (!Array.isArray(data)) return null;
+  return data.map((j) => {
+    const where = str(j.workLocation?.label);
+    return {
+      company: board,
+      ats: "rippling",
+      board,
+      jobId: String(j.uuid ?? j.url ?? ""),
+      title: str(j.name) ?? "",
+      department: str(j.department?.label),
+      team: null,
+      employmentType: null,
+      location: where,
+      locations: where ? [where] : [],
+      country: null,
+      remote: looksRemote(where) || null,
+      workplaceType: null,
+      salary: null,
+      postedAt: null,
+      updatedAt: null,
+      url: str(j.url) ?? `https://ats.rippling.com/${board}/jobs`,
+      applyUrl: str(j.url)
+    };
+  });
+}
+async function gem(board, withDescription) {
+  const data = await getJson(`https://api.gem.com/job_board/v0/${encodeURIComponent(board)}/job_posts`);
+  if (!Array.isArray(data)) return null;
+  return data.map((j) => {
+    const where = str(j.location?.name);
+    const type = str(j.location_type);
+    return {
+      company: board,
+      ats: "gem",
+      board,
+      jobId: String(j.id ?? j.absolute_url ?? ""),
+      title: str(j.title) ?? "",
+      department: str(j.departments?.[0]?.name),
+      team: null,
+      employmentType: str(j.employment_type),
+      location: where,
+      locations: [...new Set([where, ...(j.offices ?? []).map((o) => str(o.location?.name))].filter((l) => !!l))],
+      country: null,
+      remote: type ? type === "remote" : looksRemote(where) || null,
+      workplaceType: type,
+      salary: null,
+      postedAt: iso(j.first_published_at ?? j.created_at),
+      updatedAt: iso(j.updated_at),
+      url: str(j.absolute_url) ?? `https://jobs.gem.com/${board}`,
+      applyUrl: str(j.absolute_url),
+      ...withDescription ? { description: str(j.content_plain) } : {}
+    };
+  });
+}
+async function breezy(board) {
+  const data = await getJson(`https://${encodeURIComponent(board)}.breezy.hr/json`);
+  if (!Array.isArray(data)) return null;
+  return data.map((j) => {
+    const locs = j.locations?.length ? j.locations : j.location ? [j.location] : [];
+    const names = locs.map((l) => str(l.name)).filter((l) => !!l);
+    const remote = locs.some((l) => l.is_remote === true) ? true : locs.length ? false : null;
+    return {
+      company: str(j.company?.name) ?? board,
+      ats: "breezy",
+      board,
+      jobId: String(j.id ?? j.friendly_id ?? ""),
+      title: str(j.name) ?? "",
+      department: str(j.department),
+      team: null,
+      employmentType: str(j.type?.name),
+      location: names[0] ?? null,
+      locations: names,
+      country: str(locs[0]?.country?.id),
+      remote,
+      workplaceType: remote === null ? null : remote ? "remote" : null,
+      salary: str(j.salary) ? { min: null, max: null, currency: null, interval: null, text: str(j.salary) } : null,
+      postedAt: iso(j.published_date),
+      updatedAt: null,
+      url: str(j.url) ?? `https://${board}.breezy.hr/`,
+      applyUrl: str(j.url)
+    };
+  });
+}
+async function pinpoint(board, withDescription) {
+  const data = await getJson(`https://${encodeURIComponent(board)}.pinpointhq.com/postings.json`);
+  if (!data || !Array.isArray(data.data)) return null;
+  return data.data.map((j) => {
+    const where = str(j.location?.name) ?? ([j.location?.city, j.location?.province].filter(Boolean).join(", ") || null);
+    const type = str(j.workplace_type);
+    const pay = j.compensation_visible ? { min: j.compensation_minimum ?? null, max: j.compensation_maximum ?? null, currency: str(j.compensation_currency), interval: str(j.compensation_frequency), text: str(j.compensation) } : null;
+    return {
+      company: board,
+      ats: "pinpoint",
+      board,
+      jobId: String(j.id ?? j.path ?? ""),
+      title: str(j.title) ?? "",
+      department: str(j.job?.department?.name),
+      team: str(j.job?.division?.name),
+      employmentType: str(j.employment_type_text) ?? str(j.employment_type),
+      location: where,
+      locations: where ? [where] : [],
+      country: null,
+      remote: type ? type === "remote" : looksRemote(where) || null,
+      workplaceType: type,
+      salary: pay,
+      postedAt: null,
+      updatedAt: null,
+      url: str(j.url) ?? `https://${board}.pinpointhq.com/`,
+      applyUrl: str(j.url),
+      ...withDescription ? { description: htmlToText(j.description) } : {}
+    };
+  });
+}
 var WORKDAY_CAP = 2e3;
 async function fetchBoard(b, withDescription, limit2, searchTexts = []) {
   switch (b.ats) {
@@ -498,6 +624,14 @@ async function fetchBoard(b, withDescription, limit2, searchTexts = []) {
       return personio(b.board, withDescription);
     case "teamtailor":
       return teamtailor(b.board, withDescription);
+    case "rippling":
+      return rippling(b.board);
+    case "gem":
+      return gem(b.board, withDescription);
+    case "breezy":
+      return breezy(b.board);
+    case "pinpoint":
+      return pinpoint(b.board, withDescription);
     case "workday":
       return workday(b.board, withDescription, limit2, searchTexts);
   }
