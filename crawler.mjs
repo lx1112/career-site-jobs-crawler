@@ -1042,6 +1042,13 @@ function activityWithMix(events, closed = () => void 0) {
   });
 }
 
+// src/jobs/prune.ts
+var SYSTEM_DOWN_SHARE = 0.5;
+var SYSTEM_DOWN_MIN_BOARDS = 5;
+function systemDown(errors, crawled) {
+  return crawled >= SYSTEM_DOWN_MIN_BOARDS && errors >= crawled * SYSTEM_DOWN_SHARE;
+}
+
 // jobs/crawler.ts
 var args = process.argv.slice(2);
 var file = args.find((a) => !a.startsWith("--")) ?? "boards.json";
@@ -1153,11 +1160,15 @@ writeFileSync("out/status.json", JSON.stringify({ crawledAt, counts, status }));
 console.log(`content: ${facts.size} postings with a description on ${tallies.size} boards`);
 console.log(`crawl: ${boards.length} boards (${counts.live} live, ${counts.gone} gone, ${counts.error} errors ${JSON.stringify(errorsByAts)}), ${counts.jobs} jobs, ${(gz.length / 1e6).toFixed(1)} MB gzipped, ${Math.round((Date.now() - started) / 1e3)} s`);
 if (prune) {
+  const crawledByAts = {};
+  for (const b of boards) crawledByAts[b.ats] = (crawledByAts[b.ats] ?? 0) + 1;
+  const down = new Set(Object.keys(errorsByAts).filter((a) => systemDown(errorsByAts[a], crawledByAts[a] ?? 0)));
+  for (const a of down) console.log(`prune: ${a} errored on ${errorsByAts[a]} of ${crawledByAts[a]} boards; its fail counts left unchanged (system-wide failure)`);
   const dropped = [];
   const kept = [];
   for (const b of directory.boards) {
     const st = status[`${b.ats}:${b.slug}`];
-    const fails = st === "error" ? (b.fails ?? 0) + 1 : st === "live" ? 0 : b.fails ?? 0;
+    const fails = st === "error" ? (b.fails ?? 0) + (down.has(b.ats) ? 0 : 1) : st === "live" ? 0 : b.fails ?? 0;
     if (st === "gone" || fails >= (FAIL_LIMIT_BY_ATS[b.ats] ?? FAIL_LIMIT)) dropped.push({ ats: b.ats, slug: b.slug });
     else kept.push(fails ? { ats: b.ats, slug: b.slug, fails } : { ats: b.ats, slug: b.slug });
   }
