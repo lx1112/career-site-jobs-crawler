@@ -1048,6 +1048,11 @@ var SYSTEM_DOWN_MIN_BOARDS = 5;
 function systemDown(errors, crawled) {
   return crawled >= SYSTEM_DOWN_MIN_BOARDS && errors >= crawled * SYSTEM_DOWN_SHARE;
 }
+var BREAKER_AFTER = 20;
+var BREAKER_SHARE = 0.9;
+function breakerOpen(tried, errors, live) {
+  return tried >= BREAKER_AFTER && live === 0 && errors >= tried * BREAKER_SHARE;
+}
 
 // jobs/crawler.ts
 var args = process.argv.slice(2);
@@ -1106,9 +1111,17 @@ async function pace(ats, slower) {
   await sleep(at - Date.now());
 }
 async function crawlAts(ats, queue, workers, slower) {
+  const pass = { tried: 0, errors: 0, live: 0, open: false };
   const worker = async () => {
     for (let b = queue.shift(); b; b = queue.shift()) {
       const key = `${ats}:${b.slug}`;
+      if (pass.open || breakerOpen(pass.tried, pass.errors, pass.live)) {
+        if (!pass.open) console.log(`crawl: ${ats} errored on ${pass.errors} of the first ${pass.tried} boards; the other ${queue.length + 1} are marked errored without a request`);
+        pass.open = true;
+        status[key] = "error";
+        continue;
+      }
+      pass.tried++;
       await pace(ats, slower);
       try {
         const jobs = await fetchBoard({ ats: b.ats, board: b.slug }, withContent && DESCRIBED_ATS.includes(ats), LIMIT[ats] ?? 200);
@@ -1118,6 +1131,7 @@ async function crawlAts(ats, queue, workers, slower) {
           continue;
         }
         status[key] = "live";
+        pass.live++;
         counts.live++;
         for (const j of jobs) {
           lines.push(JSON.stringify(compactJob(j)));
@@ -1130,6 +1144,7 @@ async function crawlAts(ats, queue, workers, slower) {
         }
       } catch {
         status[key] = "error";
+        pass.errors++;
         if (PACE_MS[ats]) nextStart[ats] = Math.max(nextStart[ats] ?? 0, Date.now() + COOLDOWN_MS);
       }
     }
@@ -1146,7 +1161,10 @@ var failed = boards.filter((b) => status[`${b.ats}:${b.slug}`] === "error");
 if (failed.length) {
   console.log(`retry: ${failed.length} boards errored; second pass after ${RETRY_PAUSE_MS / 1e3} s`);
   await sleep(RETRY_PAUSE_MS);
-  await Promise.all(CRAWLED_ATS.map((ats) => crawlAts(ats, failed.filter((b) => b.ats === ats), 2, 2)));
+  const crawled = (ats) => boards.filter((b) => b.ats === ats).length;
+  const retried = CRAWLED_ATS.filter((ats) => !systemDown(failed.filter((b) => b.ats === ats).length, crawled(ats)));
+  for (const ats of CRAWLED_ATS) if (!retried.includes(ats)) console.log(`retry: ${ats} skipped (most of its boards errored)`);
+  await Promise.all(retried.map((ats) => crawlAts(ats, failed.filter((b) => b.ats === ats), 2, 2)));
 }
 counts.error = boards.filter((b) => status[`${b.ats}:${b.slug}`] === "error").length;
 var errorsByAts = {};
