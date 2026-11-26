@@ -1,4 +1,4 @@
-// Builds the directory of company job boards (F4, notes/f4-plan.md) from Common Crawl's URL index:
+// Builds the directory of company job boards (F4, archive/notes/f4-plan.md) from Common Crawl's URL index:
 // every URL crawled under an ATS's board host gives a company slug. Writes jobs/data/boards-cc.json.
 //   node jobs/directory.mjs [crawls=3]
 import { mkdirSync, writeFileSync } from "node:fs";
