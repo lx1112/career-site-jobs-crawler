@@ -1114,6 +1114,12 @@ function indexDiff(previous, current, status2) {
   const close = [...before].filter((k) => !now.has(k) && settled(k));
   return { open, close };
 }
+var INTERN_WORDS = `intern OR interns OR internship OR internships OR (co AND op) OR coop OR werkstudent OR stagiaire`;
+var SENIOR_WORDS = `senior OR sr OR lead OR principal OR staff OR manager OR director OR head OR vp OR chief OR experienced`;
+var LEVEL_MATCH = {
+  intern: `(title : (${INTERN_WORDS}) NOT title : (${SENIOR_WORDS}))`,
+  entry: `(title : (${INTERN_WORDS} OR junior OR jr OR (new AND grad) OR (new AND graduate) OR graduate OR graduates OR (entry AND level) OR apprentice OR apprenticeship OR trainee OR (early AND career) OR (university AND grad) OR (recent AND graduate) OR associate) NOT title : (${SENIOR_WORDS}))`
+};
 
 // src/jobs/profile.ts
 var ACTIVITY_BATCH = 2e3;
